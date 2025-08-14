@@ -12,6 +12,12 @@ pub mod clients;
 mod generated;
 mod parsers;
 mod pipeline;
+pub(crate) mod streams;
 pub use clients::*;
 pub use parsers::*;
 pub mod models;
+
+pub mod model_extensions;
+pub mod options_helpers;
+pub mod partitioned_transfer;
+pub mod transfer_validation;
