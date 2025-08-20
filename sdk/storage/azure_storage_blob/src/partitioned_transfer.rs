@@ -165,11 +165,9 @@ mod tests {
                 Body::Bytes(_) => BodyType::Bytes,
                 Body::SeekableStream(_) => BodyType::SeekableStream,
             };
+            let bytes = get_bytes(&mut content).await?;
             self.invocations.borrow_mut().push(
-                MockPartitionedUploadBehaviorInvocation::TransferOneshot(
-                    get_bytes(&mut content).await?,
-                    body_type,
-                ),
+                MockPartitionedUploadBehaviorInvocation::TransferOneshot(bytes, body_type),
             );
             Ok(())
         }
@@ -183,11 +181,10 @@ mod tests {
                 Body::Bytes(_) => BodyType::Bytes,
                 Body::SeekableStream(_) => BodyType::SeekableStream,
             };
+            let bytes = get_bytes(&mut content).await?;
             self.invocations.borrow_mut().push(
                 MockPartitionedUploadBehaviorInvocation::TransferPartition(
-                    offset,
-                    get_bytes(&mut content).await?,
-                    body_type,
+                    offset, bytes, body_type,
                 ),
             );
             Ok(())
@@ -259,10 +256,6 @@ mod tests {
 
     //////////////////
 
-    // trait SeekableStreamExt: SeekableStream {
-    //     async fn try_read_to_end(self) -> Result<Vec<u8>, std::io::Error>;
-    // }
-    // impl<T: SeekableStream> SeekableStreamExt for T {
     async fn try_read_to_end(content: &mut Box<dyn SeekableStream>) -> azure_core::Result<Vec<u8>> {
         let mut dst = vec![0u8; content.len()];
         let mut i = 0;
