@@ -128,7 +128,7 @@ fn div_round_up(left: usize, right: usize) -> usize {
 mod tests {
     use std::{cell::RefCell, mem::discriminant, ops::Deref, sync::mpsc};
 
-    use azure_core::Error;
+    use azure_core::{stream::BytesStream, Error};
     use futures::{AsyncRead, FutureExt};
 
     use super::*;
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_when_within_partition_size() -> azure_core::Result<()> {
+    async fn one_shot_bytes_when_within_partition_size() -> azure_core::Result<()> {
         let data_size: usize = 1024;
         let partition_size: usize = data_size;
         let concurrency: usize = 2;
@@ -228,10 +228,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_when_over_partition_size() -> azure_core::Result<()> {
+    async fn partition_bytes_when_over_partition_size() -> azure_core::Result<()> {
         let data_size: usize = 1024;
         let partition_size: usize = 50;
-        let concurrency: usize = 1;
+        let concurrency: usize = 2;
 
         let mock = MockPartitionedUploadBehavior::new();
         let src_data = get_random_data(data_size);
@@ -249,6 +249,55 @@ mod tests {
             &src_data[..],
             partition_size,
             BodyType::Bytes,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_shot_stream_when_within_partition_size() -> azure_core::Result<()> {
+        let data_size: usize = 1024;
+        let partition_size: usize = data_size;
+        let concurrency: usize = 2;
+
+        let mock = MockPartitionedUploadBehavior::new();
+        let src_data = get_random_data(data_size);
+
+        upload(
+            Body::SeekableStream(Box::new(BytesStream::new(Bytes::from(src_data.clone())))),
+            concurrency,
+            partition_size,
+            &mock,
+        )
+        .await?;
+
+        assert_upload_oneshot_invocations(&mock, &src_data[..], BodyType::SeekableStream);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partition_stream_when_over_partition_size() -> azure_core::Result<()> {
+        let data_size: usize = 1024;
+        let partition_size: usize = 50;
+        let concurrency: usize = 2;
+
+        let mock = MockPartitionedUploadBehavior::new();
+        let src_data = get_random_data(data_size);
+
+        upload(
+            Body::SeekableStream(Box::new(BytesStream::new(Bytes::from(src_data.clone())))),
+            concurrency,
+            partition_size,
+            &mock,
+        )
+        .await?;
+
+        assert_upload_partitioned_invocations(
+            &mock,
+            &src_data[..],
+            partition_size,
+            BodyType::SeekableStream,
         );
 
         Ok(())
