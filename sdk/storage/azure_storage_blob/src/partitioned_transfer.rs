@@ -2,7 +2,7 @@ use std::future::{self, Future};
 
 use azure_core::{
     http::{Body, RequestContent},
-    stream::SeekableStream,
+    stream::{BytesStream, SeekableStream},
 };
 use bytes::{Buf, Bytes};
 use futures::{AsyncReadExt, Stream, StreamExt, TryStreamExt};
@@ -76,7 +76,7 @@ async fn upload_stream_partitions(
     client: &impl PartitionedUploadBehavior,
 ) -> azure_core::Result<()> {
     let partitions = PartitionedStream::new(content, partition_size)
-        .map_ok(|vec_bytes| MultiBytesStream::new(vec_bytes.clone()))
+        .map_ok(BytesStream::new)
         .scan(0, |enumerated, result| match result {
             Ok(seekable_stream) => {
                 let offset = *enumerated;

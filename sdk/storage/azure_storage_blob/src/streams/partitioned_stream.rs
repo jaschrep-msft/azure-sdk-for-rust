@@ -1,33 +1,53 @@
-use std::{mem, pin::Pin, task::Poll};
+use std::{
+    mem,
+    ops::Deref,
+    pin::{pin, Pin},
+    task::Poll,
+};
 
+use azure_core::stream::SeekableStream;
 use bytes::Bytes;
 use futures::{
     ready,
     stream::{Fuse, FusedStream},
-    Stream, StreamExt,
+    AsyncRead, AsyncReadExt, Stream, StreamExt,
 };
 
-pub(crate) struct PartitionedStream<TInner: Stream<Item = azure_core::Result<Bytes>>> {
-    inner_stream: Fuse<TInner>,
-    bufs: Vec<Bytes>,
+pub(crate) struct PartitionedStream {
+    inner: Box<dyn SeekableStream>,
+    buf: Vec<u8>,
     partition_len: usize,
+    buf_offset: usize,
+    total_read: usize,
+    inner_complete: bool,
 }
 
-impl<S: Stream<Item = azure_core::Result<Bytes>>> PartitionedStream<S> {
-    pub(crate) fn new(inner: S, partition_len: usize) -> Self {
+impl PartitionedStream {
+    pub(crate) fn new(inner: Box<dyn SeekableStream>, partition_len: usize) -> Self {
         assert!(partition_len > 0);
         Self {
-            inner_stream: inner.fuse(),
-            bufs: Vec::new(),
+            buf: vec![0u8; std::cmp::min(partition_len, inner.len())],
+            inner,
             partition_len,
+            buf_offset: 0,
+            total_read: 0,
+            inner_complete: false,
         }
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        let mut ret = mem::replace(
+            &mut self.buf,
+            vec![0u8; std::cmp::min(self.partition_len, self.inner.len() - self.total_read)],
+        );
+        ret.truncate(self.buf_offset);
+        self.buf_offset = 0;
+        ret
     }
 }
 
-impl<TInner: Stream<Item = azure_core::Result<Bytes>> + Unpin> Stream
-    for PartitionedStream<TInner>
-{
-    type Item = azure_core::Result<Vec<Bytes>>;
+impl Stream for PartitionedStream {
+    type Item = azure_core::Result<Bytes>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -36,33 +56,32 @@ impl<TInner: Stream<Item = azure_core::Result<Bytes>> + Unpin> Stream
         let this = self.get_mut();
 
         loop {
-            match ready!(this.inner_stream.poll_next_unpin(cx)) {
-                Some(bytes) => {
-                    this.bufs.push(bytes?);
-                    if this.bufs.iter().map(|b| b.len()).sum::<usize>() >= this.partition_len {
-                        return Poll::Ready(Some(Ok(mem::replace(&mut this.bufs, Vec::new()))));
+            if this.inner_complete || this.buf_offset >= this.buf.len() {
+                let ret = this.take();
+                return if ret.is_empty() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(Bytes::from(ret))))
+                };
+            } else {
+                match ready!(pin!(&mut this.inner).poll_read(cx, &mut this.buf[this.buf_offset..]))
+                {
+                    Ok(bytes_read) => {
+                        this.buf_offset += bytes_read;
+                        this.total_read += bytes_read;
+                        this.inner_complete = bytes_read == 0;
                     }
-                }
-                None => {
-                    return Poll::Ready(if this.bufs.is_empty() {
-                        None
-                    } else {
-                        Some(Ok(mem::take(&mut this.bufs)))
-                    })
+                    Err(e) => {
+                        return Poll::Ready(Some(Err(e.into())));
+                    }
                 }
             }
         }
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner_stream.size_hint()
-    }
 }
 
-impl<TInner: FusedStream + Stream<Item = azure_core::Result<Bytes>> + Unpin> FusedStream
-    for PartitionedStream<TInner>
-{
+impl FusedStream for PartitionedStream {
     fn is_terminated(&self) -> bool {
-        self.inner_stream.is_terminated() && self.bufs.is_empty()
+        self.inner_complete && self.buf.is_empty()
     }
 }
