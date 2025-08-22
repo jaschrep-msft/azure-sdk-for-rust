@@ -17,6 +17,8 @@ pub use clients::*;
 pub use parsers::*;
 pub mod models;
 
+pub mod client_impl;
+pub use client_impl::*;
 pub mod model_extensions;
 pub mod options_helpers;
 pub mod partitioned_transfer;

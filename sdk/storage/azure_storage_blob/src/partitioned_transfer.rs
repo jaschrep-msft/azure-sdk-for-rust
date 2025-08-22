@@ -7,12 +7,9 @@ use azure_core::{
 use bytes::{Buf, Bytes};
 use futures::{AsyncReadExt, Stream, StreamExt, TryStreamExt};
 
-use crate::streams::{
-    multi_bytes_stream::MultiBytesStream,
-    partitioned_stream::{self, PartitionedStream},
-};
+use crate::streams::partitioned_stream::PartitionedStream;
 
-trait PartitionedUploadBehavior {
+pub(crate) trait PartitionedUploadBehavior {
     async fn transfer_oneshot(&self, content: Body) -> azure_core::Result<()>;
     async fn transfer_partition(&self, offset: usize, content: Body) -> azure_core::Result<()>;
     async fn initialize(&self, content_len: usize) -> azure_core::Result<()>;
@@ -25,7 +22,7 @@ enum ConcurrentAccessStrategy {
     Lease(String),
 }
 
-async fn upload(
+pub(crate) async fn upload(
     content: Body,
     parallel: usize,
     partition_size: usize,
