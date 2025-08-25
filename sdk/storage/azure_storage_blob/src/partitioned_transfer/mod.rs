@@ -1,93 +1,13 @@
-use std::future::{self, Future};
+mod download;
+mod upload;
+pub use download::*;
+pub use upload::*;
 
-use azure_core::{
-    http::{Body, RequestContent},
-    stream::{BytesStream, SeekableStream},
-};
-use bytes::{Buf, Bytes};
-use futures::{AsyncReadExt, Stream, StreamExt, TryStreamExt};
+use std::future::Future;
 
-use crate::streams::partitioned_stream::PartitionedStream;
+use futures::{Stream, TryStreamExt};
 
-pub(crate) trait PartitionedUploadBehavior {
-    async fn transfer_oneshot(&self, content: Body) -> azure_core::Result<()>;
-    async fn transfer_partition(&self, offset: usize, content: Body) -> azure_core::Result<()>;
-    async fn initialize(&self, content_len: usize) -> azure_core::Result<()>;
-    async fn finalize(&self) -> azure_core::Result<()>;
-}
-
-enum ConcurrentAccessStrategy {
-    None,
-    ETagLock,
-    Lease(String),
-}
-
-pub(crate) async fn upload(
-    content: Body,
-    parallel: usize,
-    partition_size: usize,
-    client: &impl PartitionedUploadBehavior,
-) -> azure_core::Result<()> {
-    if content.len() <= partition_size {
-        client.transfer_oneshot(content).await?;
-        return Ok(());
-    }
-
-    client.initialize(content.len()).await?;
-
-    match content {
-        Body::Bytes(bytes) => {
-            upload_bytes_partitions(bytes, parallel, partition_size, client).await?;
-        }
-        Body::SeekableStream(seekable_stream) => {
-            upload_stream_partitions(seekable_stream, parallel, partition_size, client).await?;
-        }
-    }
-
-    client.finalize().await?;
-
-    Ok(())
-}
-
-async fn upload_bytes_partitions(
-    content: Bytes,
-    parallel: usize,
-    partition_size: usize,
-    client: &impl PartitionedUploadBehavior,
-) -> azure_core::Result<()> {
-    let num_partitions = div_round_up(content.len(), partition_size);
-    let partitions = (0..num_partitions)
-        .map(|i| i * partition_size)
-        .map(|offset| offset..std::cmp::min(offset + partition_size, content.len()))
-        .map(|range| (range.start, content.slice(range)));
-    let ops = partitions
-        .map(|(offset, bytes)| Ok(move || client.transfer_partition(offset, Body::Bytes(bytes))));
-    run_all_with_concurrency_limit(futures::stream::iter(ops), parallel).await?;
-    Ok(())
-}
-
-async fn upload_stream_partitions(
-    content: Box<dyn SeekableStream>,
-    parallel: usize,
-    partition_size: usize,
-    client: &impl PartitionedUploadBehavior,
-) -> azure_core::Result<()> {
-    let partitions = PartitionedStream::new(content, partition_size)
-        .map_ok(BytesStream::new)
-        .scan(0, |enumerated, result| match result {
-            Ok(seekable_stream) => {
-                let offset = *enumerated;
-                *enumerated += seekable_stream.len();
-                future::ready(Some(Ok((offset, seekable_stream))))
-            }
-            Err(e) => future::ready(Some(Err(e))),
-        });
-    let ops = partitions.map_ok(|(offset, stream)| {
-        move || client.transfer_partition(offset, Body::SeekableStream(Box::new(stream)))
-    });
-    run_all_with_concurrency_limit(ops, parallel).await?;
-    Ok(())
-}
+type AzureResult<T> = azure_core::Result<T>;
 
 async fn run_all_with_concurrency_limit<TFut, TErr>(
     mut ops: impl Stream<Item = Result<impl FnOnce() -> TFut, TErr>> + Unpin,
@@ -125,8 +45,13 @@ fn div_round_up(left: usize, right: usize) -> usize {
 mod tests {
     use std::{cell::RefCell, mem::discriminant, ops::Deref, sync::mpsc};
 
-    use azure_core::{stream::BytesStream, Error};
-    use futures::{AsyncRead, FutureExt};
+    use azure_core::{
+        http::Body,
+        stream::{BytesStream, SeekableStream},
+        Error,
+    };
+    use bytes::Bytes;
+    use futures::{AsyncRead, AsyncReadExt, FutureExt};
 
     use super::*;
 
@@ -157,7 +82,7 @@ mod tests {
     }
 
     impl PartitionedUploadBehavior for MockPartitionedUploadBehavior {
-        async fn transfer_oneshot(&self, mut content: Body) -> azure_core::Result<()> {
+        async fn transfer_oneshot(&self, mut content: Body) -> AzureResult<()> {
             let body_type = match content {
                 Body::Bytes(_) => BodyType::Bytes,
                 Body::SeekableStream(_) => BodyType::SeekableStream,
@@ -169,11 +94,7 @@ mod tests {
             Ok(())
         }
 
-        async fn transfer_partition(
-            &self,
-            offset: usize,
-            mut content: Body,
-        ) -> azure_core::Result<()> {
+        async fn transfer_partition(&self, offset: usize, mut content: Body) -> AzureResult<()> {
             let body_type = match content {
                 Body::Bytes(_) => BodyType::Bytes,
                 Body::SeekableStream(_) => BodyType::SeekableStream,
@@ -187,14 +108,14 @@ mod tests {
             Ok(())
         }
 
-        async fn initialize(&self, content_len: usize) -> azure_core::Result<()> {
+        async fn initialize(&self, content_len: usize) -> AzureResult<()> {
             self.invocations.borrow_mut().push(
                 MockPartitionedUploadBehaviorInvocation::Initialize(content_len),
             );
             Ok(())
         }
 
-        async fn finalize(&self) -> azure_core::Result<()> {
+        async fn finalize(&self) -> AzureResult<()> {
             self.invocations
                 .borrow_mut()
                 .push(MockPartitionedUploadBehaviorInvocation::Finalize());
@@ -203,7 +124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_bytes_when_within_partition_size() -> azure_core::Result<()> {
+    async fn one_shot_bytes_when_within_partition_size() -> AzureResult<()> {
         let data_size: usize = 1024;
         let partition_size: usize = data_size;
         let concurrency: usize = 2;
@@ -225,7 +146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_bytes_when_over_partition_size() -> azure_core::Result<()> {
+    async fn partition_bytes_when_over_partition_size() -> AzureResult<()> {
         let data_size: usize = 1024;
         let partition_size: usize = 50;
         let concurrency: usize = 2;
@@ -252,7 +173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_stream_when_within_partition_size() -> azure_core::Result<()> {
+    async fn one_shot_stream_when_within_partition_size() -> AzureResult<()> {
         let data_size: usize = 1024;
         let partition_size: usize = data_size;
         let concurrency: usize = 2;
@@ -274,7 +195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_stream_when_over_partition_size() -> azure_core::Result<()> {
+    async fn partition_stream_when_over_partition_size() -> AzureResult<()> {
         let data_size: usize = 1024;
         let partition_size: usize = 50;
         let concurrency: usize = 2;
@@ -302,7 +223,7 @@ mod tests {
 
     //////////////////
 
-    async fn try_read_to_end(content: &mut Box<dyn SeekableStream>) -> azure_core::Result<Vec<u8>> {
+    async fn try_read_to_end(content: &mut Box<dyn SeekableStream>) -> AzureResult<Vec<u8>> {
         let mut dst = vec![0u8; content.len()];
         let mut i = 0;
         loop {
@@ -317,7 +238,7 @@ mod tests {
     }
     // }
 
-    async fn get_bytes(content: &mut Body) -> azure_core::Result<Vec<u8>> {
+    async fn get_bytes(content: &mut Body) -> AzureResult<Vec<u8>> {
         match content {
             Body::Bytes(bytes) => Ok(bytes.to_vec()),
             Body::SeekableStream(seekable_stream) => try_read_to_end(seekable_stream).await,
