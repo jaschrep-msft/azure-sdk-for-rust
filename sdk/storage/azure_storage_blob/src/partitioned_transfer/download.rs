@@ -36,60 +36,28 @@ pub(crate) async fn download<'a>(
         return Ok(Box::new(initial_response.into_raw_body()));
     }
 
-    let total_ranges = div_round_up(
-        content_range.total_length().try_into().unwrap(),
-        partition_size,
-    );
-    let ranges = (1..total_ranges).map(|i| i * partition_size);
+    let partition_size = partition_size as u64;
+    let total_ranges =
+        ((content_range.total_length() as f64) / (partition_size as f64)).ceil() as u64;
 
-    Ok(Box::new(ParallelSourceBufferedStream {
-        client,
-        ops: VecDeque::from([TransferOp::Transferring(Box::pin(
-            initial_response.into_raw_body().collect(),
-        ))]),
-        max_ops: parallel,
-        ranges: VecDeque::new(),
-    }))
-}
+    let mut ranges: VecDeque<Range<u64>> = (1u64..total_ranges)
+        .map(|i| (i * partition_size..i * partition_size + partition_size))
+        .collect();
+    let mut ops = VecDeque::from([TransferOp::Transferring(Box::pin(
+        initial_response.into_raw_body().collect(),
+    ))]);
 
-enum TransferOp<'a> {
-    AwaitingResponse(Pin<Box<dyn Future<Output = AzureResult<Response<()>>> + 'a>>),
-    Transferring(Pin<Box<dyn Future<Output = AzureResult<Bytes>> + 'a>>),
-    Ready(Bytes),
-}
-
-struct ParallelSourceBufferedStream<'a, TClient: PartitionedDownloadBehavior> {
-    client: &'a TClient,
-    ops: VecDeque<TransferOp<'a>>,
-    max_ops: usize,
-    ranges: VecDeque<Range<u64>>,
-}
-
-impl<TClient: PartitionedDownloadBehavior> ParallelSourceBufferedStream<'_, TClient> {
-    fn fill_ops(&mut self) {
-        while self.ops.len() < self.max_ops {
-            match self.ranges.pop_front() {
-                Some(range) => self.ops.push_back(TransferOp::AwaitingResponse(Box::pin(
-                    self.client.transfer_range(range),
+    let stream = futures::stream::poll_fn(move |cx| {
+        while ops.len() < parallel {
+            match ranges.pop_front() {
+                Some(range) => ops.push_back(TransferOp::AwaitingResponse(Box::pin(
+                    client.transfer_range(range),
                 ))),
                 None => break,
             }
         }
-    }
-}
 
-impl<TClient: PartitionedDownloadBehavior> Stream for ParallelSourceBufferedStream<'_, TClient> {
-    type Item = AzureResult<Bytes>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        this.fill_ops();
-
-        for op in this.ops.iter_mut() {
+        for op in ops.iter_mut() {
             match op {
                 TransferOp::AwaitingResponse(fut) => {
                     if let Poll::Ready(res) = fut.as_mut().poll(cx) {
@@ -114,13 +82,21 @@ impl<TClient: PartitionedDownloadBehavior> Stream for ParallelSourceBufferedStre
                 TransferOp::Ready(_bytes) => {}
             }
         }
-        match this.ops.pop_front() {
+        match ops.pop_front() {
             Some(TransferOp::Ready(bytes)) => Poll::Ready(Some(Ok(bytes))),
             Some(transfer_op) => {
-                this.ops.push_front(transfer_op);
+                ops.push_front(transfer_op);
                 Poll::Pending
             }
             None => Poll::Ready(None),
         }
-    }
+    });
+
+    Ok(Box::new(stream))
+}
+
+enum TransferOp<'a> {
+    AwaitingResponse(Pin<Box<dyn Future<Output = AzureResult<Response<()>>> + 'a>>),
+    Transferring(Pin<Box<dyn Future<Output = AzureResult<Bytes>> + 'a>>),
+    Ready(Bytes),
 }
