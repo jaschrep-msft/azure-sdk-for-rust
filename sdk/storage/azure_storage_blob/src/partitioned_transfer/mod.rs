@@ -74,8 +74,8 @@ mod tests {
     }
 
     impl MockPartitionedUploadBehavior {
-        pub fn new() -> MockPartitionedUploadBehavior {
-            MockPartitionedUploadBehavior {
+        pub fn new() -> Self {
+            Self {
                 invocations: RefCell::new(vec![]),
             }
         }

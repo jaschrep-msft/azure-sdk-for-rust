@@ -16,40 +16,36 @@ pub(crate) trait PartitionedDownloadBehavior {
     async fn transfer_range(&self, range: Range<u64>) -> AzureResult<Response<()>>;
 }
 
-pub(crate) async fn download<'a>(
+pub(crate) async fn download(
     parallel: usize,
     partition_size: usize,
-    client: &'a impl PartitionedDownloadBehavior,
-) -> AzureResult<Box<dyn Stream<Item = AzureResult<Bytes>> + 'a>> {
+    client: &'_ impl PartitionedDownloadBehavior,
+) -> AzureResult<impl Stream<Item = AzureResult<Bytes>> + '_> {
     let err = || {
         azure_core::Error::message(
             azure_core::error::ErrorKind::Other,
             "Failed to parse Content-Range header {}.",
         )
     };
-    let initial_response = client.transfer_range(0..partition_size as u64).await?;
+    let partition_size = partition_size as u64;
+    let initial_response = client.transfer_range(0..partition_size).await?;
     let content_range: ContentRange = initial_response
         .headers()
         .get_optional_as(&"content-range".into())?
         .ok_or_else(err)?;
-    if content_range.end() + 1 == content_range.total_length() {
-        return Ok(Box::new(initial_response.into_raw_body()));
-    }
 
-    let partition_size = partition_size as u64;
     let total_ranges =
         ((content_range.total_length() as f64) / (partition_size as f64)).ceil() as u64;
 
-    let mut ranges: VecDeque<Range<u64>> = (1u64..total_ranges)
-        .map(|i| (i * partition_size..i * partition_size + partition_size))
-        .collect();
+    let mut ranges = (1u64..total_ranges)
+        .map(move |i| (i * partition_size..i * partition_size + partition_size));
     let mut ops = VecDeque::from([TransferOp::Transferring(Box::pin(
         initial_response.into_raw_body().collect(),
     ))]);
 
     let stream = futures::stream::poll_fn(move |cx| {
         while ops.len() < parallel {
-            match ranges.pop_front() {
+            match ranges.next() {
                 Some(range) => ops.push_back(TransferOp::AwaitingResponse(Box::pin(
                     client.transfer_range(range),
                 ))),
@@ -58,28 +54,38 @@ pub(crate) async fn download<'a>(
         }
 
         for op in ops.iter_mut() {
-            match op {
-                TransferOp::AwaitingResponse(fut) => {
-                    if let Poll::Ready(res) = fut.as_mut().poll(cx) {
-                        match res {
-                            Ok(response) => {
-                                *op = TransferOp::Transferring(Box::pin(
-                                    response.into_raw_body().collect(),
-                                ));
+            // rechecking the op if state changed handles edge case where the next step of the transfer
+            // immediately returns completed. needed for mock synchronous implementations
+            let mut check_op = true;
+            while check_op {
+                check_op = false;
+                match op {
+                    TransferOp::AwaitingResponse(fut) => {
+                        if let Poll::Ready(res) = fut.as_mut().poll(cx) {
+                            match res {
+                                Ok(response) => {
+                                    *op = TransferOp::Transferring(Box::pin(
+                                        response.into_raw_body().collect(),
+                                    ));
+                                    check_op = true;
+                                }
+                                Err(e) => return Poll::Ready(Some(Err(e))),
                             }
-                            Err(e) => return Poll::Ready(Some(Err(e))),
                         }
                     }
-                }
-                TransferOp::Transferring(fut) => {
-                    if let Poll::Ready(res) = fut.as_mut().poll(cx) {
-                        match res {
-                            Ok(bytes) => *op = TransferOp::Ready(bytes),
-                            Err(e) => return Poll::Ready(Some(Err(e))),
+                    TransferOp::Transferring(fut) => {
+                        if let Poll::Ready(res) = fut.as_mut().poll(cx) {
+                            match res {
+                                Ok(bytes) => {
+                                    *op = TransferOp::Ready(bytes);
+                                    check_op = true;
+                                }
+                                Err(e) => return Poll::Ready(Some(Err(e))),
+                            }
                         }
                     }
+                    TransferOp::Ready(_bytes) => {}
                 }
-                TransferOp::Ready(_bytes) => {}
             }
         }
         match ops.pop_front() {
@@ -95,8 +101,218 @@ pub(crate) async fn download<'a>(
     Ok(Box::new(stream))
 }
 
-enum TransferOp<'a> {
-    AwaitingResponse(Pin<Box<dyn Future<Output = AzureResult<Response<()>>> + 'a>>),
-    Transferring(Pin<Box<dyn Future<Output = AzureResult<Bytes>> + 'a>>),
+enum TransferOp<FutResponse, FutBytes> {
+    AwaitingResponse(Pin<Box<FutResponse>>),
+    Transferring(Pin<Box<FutBytes>>),
     Ready(Bytes),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::RefCell,
+        cmp::{max, min},
+    };
+
+    use azure_core::{
+        http::{headers::Headers, RawResponse, StatusCode},
+        stream::BytesStream,
+    };
+    use futures::StreamExt;
+    use rand::Rng;
+    use tokio::time::{sleep, Duration};
+
+    use super::*;
+
+    #[derive(Debug)]
+    enum MockPartitionedDownloadBehaviorInvocation {
+        TransferRange(Range<u64>),
+    }
+
+    struct MockPartitionedDownloadBehavior {
+        pub invocations: RefCell<Vec<MockPartitionedDownloadBehaviorInvocation>>,
+        pub data: Bytes,
+        pub delay_millis: Option<Range<u64>>,
+    }
+
+    impl MockPartitionedDownloadBehavior {
+        pub fn new(data: impl Into<Bytes>, delay_millis: Option<Range<u64>>) -> Self {
+            Self {
+                invocations: RefCell::new(vec![]),
+                data: data.into(),
+                delay_millis,
+            }
+        }
+    }
+
+    impl PartitionedDownloadBehavior for MockPartitionedDownloadBehavior {
+        async fn transfer_range(&self, range: Range<u64>) -> AzureResult<Response<()>> {
+            self.invocations.borrow_mut().push(
+                MockPartitionedDownloadBehaviorInvocation::TransferRange(range.clone()),
+            );
+
+            if let Some(delay_millis_range) = self.delay_millis.clone() {
+                let millis = rand::random_range(delay_millis_range);
+                sleep(Duration::from_millis(millis)).await
+            }
+
+            let range = max(range.start, 0)..min(range.end, self.data.len() as u64);
+            let mut headers = Headers::new();
+            headers.insert(
+                "content-range",
+                ContentRange::new(range.start, range.end - 1, self.data.len() as u64).to_string(),
+            );
+            let range = range.start as usize..range.end as usize;
+            let raw = RawResponse::new(
+                StatusCode::PartialContent,
+                headers,
+                Box::pin(BytesStream::from(self.data.slice(range))),
+            );
+            Ok(Response::from(raw))
+        }
+    }
+
+    #[tokio::test]
+    async fn download_single_range_oversized() -> AzureResult<()> {
+        let data_size: usize = 123;
+        let partition_size: usize = 1024;
+        let parallel: usize = 2;
+
+        let data = get_random_data(data_size);
+        let mock = MockPartitionedDownloadBehavior::new(data.clone(), None);
+
+        let downloaded_data = download(parallel, partition_size, &mock)
+            .await?
+            .buffer_all()
+            .await?;
+
+        assert_eq!(downloaded_data[..], data[..]);
+        assert_eq!(mock.invocations.borrow().len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_single_range_exact() -> AzureResult<()> {
+        let data_size: usize = 1024;
+        let partition_size: usize = 1024;
+        let parallel: usize = 2;
+
+        let data = get_random_data(data_size);
+        let mock = MockPartitionedDownloadBehavior::new(data.clone(), None);
+
+        let downloaded_data = download(parallel, partition_size, &mock)
+            .await?
+            .buffer_all()
+            .await?;
+
+        assert_eq!(downloaded_data[..], data[..]);
+        assert_eq!(mock.invocations.borrow().len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_multi_range_exact() -> AzureResult<()> {
+        let segments = 8;
+        let data_size: usize = 1024 * segments;
+        let partition_size: usize = 1024;
+        let parallel: usize = 2;
+
+        let data = get_random_data(data_size);
+        let mock = MockPartitionedDownloadBehavior::new(data.clone(), None);
+
+        let downloaded_data = download(parallel, partition_size, &mock)
+            .await?
+            .buffer_all()
+            .await?;
+
+        assert_eq!(downloaded_data[..], data[..]);
+        assert_eq!(mock.invocations.borrow().len(), segments);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_multi_range_partial() -> AzureResult<()> {
+        let segments = 8;
+        let data_size: usize = 1024 * (segments - 1) + 123;
+        let partition_size: usize = 1024;
+        let parallel: usize = 2;
+
+        let data = get_random_data(data_size);
+        let mock = MockPartitionedDownloadBehavior::new(data.clone(), None);
+
+        let downloaded_data = download(parallel, partition_size, &mock)
+            .await?
+            .buffer_all()
+            .await?;
+
+        assert_eq!(downloaded_data[..], data[..]);
+        assert_eq!(mock.invocations.borrow().len(), segments);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_ranges_sequential() -> AzureResult<()> {
+        let segments: usize = 8;
+        let partition_size: usize = 1024;
+        let data_size: usize = partition_size * segments;
+        let parallel: usize = 1;
+
+        let data = get_random_data(data_size);
+        let mock = MockPartitionedDownloadBehavior::new(data.clone(), None);
+
+        let downloaded_data = download(parallel, partition_size, &mock)
+            .await?
+            .buffer_all()
+            .await?;
+
+        assert_eq!(downloaded_data[..], data[..]);
+        assert_eq!(mock.invocations.borrow().len(), segments);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_ranges_parallel_maintain_order() -> AzureResult<()> {
+        let segments: usize = 20;
+        let partition_size: usize = 3;
+        let data_size: usize = partition_size * segments;
+        let parallel: usize = 16;
+
+        let data = get_random_data(data_size);
+        let mock = MockPartitionedDownloadBehavior::new(data.clone(), Some(1..5));
+
+        let downloaded_data = download(parallel, partition_size, &mock)
+            .await?
+            .buffer_all()
+            .await?;
+
+        assert_eq!(downloaded_data[..], data[..]);
+        assert_eq!(mock.invocations.borrow().len(), segments);
+
+        Ok(())
+    }
+
+    trait BytesTryStreamExt {
+        async fn buffer_all(&mut self) -> AzureResult<Vec<u8>>;
+    }
+    impl<S: Stream<Item = Result<Bytes, Error>> + Unpin> BytesTryStreamExt for S {
+        async fn buffer_all(&mut self) -> AzureResult<Vec<u8>> {
+            let mut buffer = Vec::<u8>::new();
+            while let Some(bytes) = self.try_next().await? {
+                buffer.extend_from_slice(&bytes);
+            }
+
+            Ok(buffer)
+        }
+    }
+
+    fn get_random_data(len: usize) -> Vec<u8> {
+        let mut data: Vec<u8> = vec![0; len];
+        rand::fill(&mut data[..]);
+        data
+    }
 }
