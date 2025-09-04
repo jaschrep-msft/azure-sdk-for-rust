@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, f32::consts::E, ops::Range, pin::Pin, task::Poll};
 
 use azure_core::{
-    http::{request::options::ContentRange, Response},
+    http::{request::options::ContentRange, RawResponse, Response},
     Error,
 };
 use bytes::Bytes;
@@ -13,7 +13,7 @@ use futures::{
 use super::*;
 
 pub(crate) trait PartitionedDownloadBehavior {
-    async fn transfer_range(&self, range: Range<u64>) -> AzureResult<Response<()>>;
+    async fn transfer_range(&self, range: Range<u64>) -> AzureResult<RawResponse>;
 }
 
 pub(crate) async fn download(
@@ -40,7 +40,7 @@ pub(crate) async fn download(
     let mut ranges = (1u64..total_ranges)
         .map(move |i| (i * partition_size..i * partition_size + partition_size));
     let mut ops = VecDeque::from([TransferOp::Transferring(Box::pin(
-        initial_response.into_raw_body().collect(),
+        initial_response.into_body().collect(),
     ))]);
 
     let stream = futures::stream::poll_fn(move |cx| {
@@ -65,7 +65,7 @@ pub(crate) async fn download(
                             match res {
                                 Ok(response) => {
                                     *op = TransferOp::Transferring(Box::pin(
-                                        response.into_raw_body().collect(),
+                                        response.into_body().collect(),
                                     ));
                                     check_op = true;
                                 }

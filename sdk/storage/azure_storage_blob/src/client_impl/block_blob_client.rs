@@ -30,7 +30,7 @@ struct BlockBlobClientUploadBehavior<'a> {
 impl<'a> BlockBlobClientUploadBehavior<'a> {
     fn new(client: &'a BlockBlobClient) -> Self {
         let (blocks_sender, blocks_receiver) = async_channel::unbounded();
-        BlockBlobClientUploadBehavior {
+        Self {
             client,
             blocks_sender,
             blocks_receiver,
