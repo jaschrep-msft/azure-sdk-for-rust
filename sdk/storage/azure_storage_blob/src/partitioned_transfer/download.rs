@@ -1,26 +1,29 @@
-use std::{collections::VecDeque, f32::consts::E, ops::Range, pin::Pin, task::Poll};
+use std::{collections::VecDeque, ops::Range, task::Poll};
 
 use azure_core::{
-    http::{request::options::ContentRange, RawResponse, Response},
+    http::{request::options::ContentRange, response::ResponseBody, RawResponse, Response},
     Error,
 };
 use bytes::Bytes;
 use futures::{
-    future::{self, SelectAll},
+    future::{self, BoxFuture},
     ready, FutureExt,
 };
 
 use super::*;
 
 pub(crate) trait PartitionedDownloadBehavior {
-    async fn transfer_range(&self, range: Range<u64>) -> AzureResult<RawResponse>;
+    fn transfer_range(
+        &self,
+        range: Range<u64>,
+    ) -> impl Future<Output = AzureResult<RawResponse>> + Send;
 }
 
-pub(crate) async fn download(
+pub(crate) async fn download<T: PartitionedDownloadBehavior>(
     parallel: usize,
     partition_size: usize,
-    client: &'_ impl PartitionedDownloadBehavior,
-) -> AzureResult<impl Stream<Item = AzureResult<Bytes>> + '_> {
+    client: &'_ T,
+) -> AzureResult<impl Stream<Item = AzureResult<Bytes>> + use<'_, T>> {
     let err = || {
         azure_core::Error::message(
             azure_core::error::ErrorKind::Other,
@@ -39,16 +42,17 @@ pub(crate) async fn download(
 
     let mut ranges = (1u64..total_ranges)
         .map(move |i| (i * partition_size..i * partition_size + partition_size));
-    let mut ops = VecDeque::from([TransferOp::Transferring(Box::pin(
-        initial_response.into_body().collect(),
-    ))]);
+
+    let mut ops = VecDeque::from([TransferOp::Transferring(
+        initial_response.into_body().collect().boxed(),
+    )]);
 
     let stream = futures::stream::poll_fn(move |cx| {
         while ops.len() < parallel {
             match ranges.next() {
-                Some(range) => ops.push_back(TransferOp::AwaitingResponse(Box::pin(
-                    client.transfer_range(range),
-                ))),
+                Some(range) => ops.push_back(TransferOp::AwaitingResponse(
+                    client.transfer_range(range).boxed(),
+                )),
                 None => break,
             }
         }
@@ -64,9 +68,9 @@ pub(crate) async fn download(
                         if let Poll::Ready(res) = fut.as_mut().poll(cx) {
                             match res {
                                 Ok(response) => {
-                                    *op = TransferOp::Transferring(Box::pin(
-                                        response.into_body().collect(),
-                                    ));
+                                    *op = TransferOp::Transferring(
+                                        response.into_body().collect().boxed(),
+                                    );
                                     check_op = true;
                                 }
                                 Err(e) => return Poll::Ready(Some(Err(e))),
@@ -98,12 +102,12 @@ pub(crate) async fn download(
         }
     });
 
-    Ok(Box::new(stream))
+    Ok(stream)
 }
 
 enum TransferOp<FutResponse, FutBytes> {
-    AwaitingResponse(Pin<Box<FutResponse>>),
-    Transferring(Pin<Box<FutBytes>>),
+    AwaitingResponse(FutResponse),
+    Transferring(FutBytes),
     Ready(Bytes),
 }
 
@@ -120,7 +124,10 @@ mod tests {
     };
     use futures::StreamExt;
     use rand::Rng;
-    use tokio::time::{sleep, Duration};
+    use tokio::{
+        sync::Mutex,
+        time::{sleep, Duration},
+    };
 
     use super::*;
 
@@ -130,7 +137,7 @@ mod tests {
     }
 
     struct MockPartitionedDownloadBehavior {
-        pub invocations: RefCell<Vec<MockPartitionedDownloadBehaviorInvocation>>,
+        pub invocations: Mutex<Vec<MockPartitionedDownloadBehaviorInvocation>>,
         pub data: Bytes,
         pub delay_millis: Option<Range<u64>>,
     }
@@ -138,7 +145,7 @@ mod tests {
     impl MockPartitionedDownloadBehavior {
         pub fn new(data: impl Into<Bytes>, delay_millis: Option<Range<u64>>) -> Self {
             Self {
-                invocations: RefCell::new(vec![]),
+                invocations: Mutex::new(vec![]),
                 data: data.into(),
                 delay_millis,
             }
@@ -146,10 +153,12 @@ mod tests {
     }
 
     impl PartitionedDownloadBehavior for MockPartitionedDownloadBehavior {
-        async fn transfer_range(&self, range: Range<u64>) -> AzureResult<Response<()>> {
-            self.invocations.borrow_mut().push(
-                MockPartitionedDownloadBehaviorInvocation::TransferRange(range.clone()),
-            );
+        async fn transfer_range(&self, range: Range<u64>) -> AzureResult<RawResponse> {
+            {
+                self.invocations.lock().await.push(
+                    MockPartitionedDownloadBehaviorInvocation::TransferRange(range.clone()),
+                );
+            }
 
             if let Some(delay_millis_range) = self.delay_millis.clone() {
                 let millis = rand::random_range(delay_millis_range);
@@ -168,7 +177,7 @@ mod tests {
                 headers,
                 Box::pin(BytesStream::from(self.data.slice(range))),
             );
-            Ok(Response::from(raw))
+            Ok(raw)
         }
     }
 
@@ -187,7 +196,7 @@ mod tests {
             .await?;
 
         assert_eq!(downloaded_data[..], data[..]);
-        assert_eq!(mock.invocations.borrow().len(), 1);
+        assert_eq!(mock.invocations.lock().await.len(), 1);
 
         Ok(())
     }
@@ -207,7 +216,7 @@ mod tests {
             .await?;
 
         assert_eq!(downloaded_data[..], data[..]);
-        assert_eq!(mock.invocations.borrow().len(), 1);
+        assert_eq!(mock.invocations.lock().await.len(), 1);
 
         Ok(())
     }
@@ -228,7 +237,7 @@ mod tests {
             .await?;
 
         assert_eq!(downloaded_data[..], data[..]);
-        assert_eq!(mock.invocations.borrow().len(), segments);
+        assert_eq!(mock.invocations.lock().await.len(), segments);
 
         Ok(())
     }
@@ -249,7 +258,7 @@ mod tests {
             .await?;
 
         assert_eq!(downloaded_data[..], data[..]);
-        assert_eq!(mock.invocations.borrow().len(), segments);
+        assert_eq!(mock.invocations.lock().await.len(), segments);
 
         Ok(())
     }
@@ -270,7 +279,7 @@ mod tests {
             .await?;
 
         assert_eq!(downloaded_data[..], data[..]);
-        assert_eq!(mock.invocations.borrow().len(), segments);
+        assert_eq!(mock.invocations.lock().await.len(), segments);
 
         Ok(())
     }
@@ -291,7 +300,7 @@ mod tests {
             .await?;
 
         assert_eq!(downloaded_data[..], data[..]);
-        assert_eq!(mock.invocations.borrow().len(), segments);
+        assert_eq!(mock.invocations.lock().await.len(), segments);
 
         Ok(())
     }

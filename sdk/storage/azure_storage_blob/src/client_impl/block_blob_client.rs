@@ -6,12 +6,13 @@ use uuid::Uuid;
 use crate::{
     generated::BlockBlobClient,
     models::{Block, BlockLookupList},
-    partitioned_transfer::*,
+    partitioned_transfer::{self, PartitionedUploadBehavior},
 };
 
 impl BlockBlobClient {
     async fn managed_upload(&self, body: Body) -> azure_core::Result<()> {
-        upload(body, 1, 1024, &BlockBlobClientUploadBehavior::new(self)).await?;
+        partitioned_transfer::upload(body, 1, 1024, &BlockBlobClientUploadBehavior::new(self))
+            .await?;
         Ok(())
     }
 }
