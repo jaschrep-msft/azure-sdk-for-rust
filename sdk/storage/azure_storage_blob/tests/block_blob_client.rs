@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use azure_core::{
-    http::{RequestContent, StatusCode},
+    http::{Body, RequestContent, StatusCode},
     Bytes,
 };
 use azure_core_test::{recorded, TestContext};
@@ -111,6 +111,36 @@ async fn test_block_list(ctx: TestContext) -> Result<(), Box<dyn Error>> {
     assert!(block_list.uncommitted_blocks.is_none());
 
     container_client.delete_container(None).await?;
+    Ok(())
+}
+
+#[recorded::test]
+async fn managed_upload(ctx: TestContext) -> Result<(), Box<dyn Error>> {
+    let recording = ctx.recording();
+    let container_client = get_container_client(recording, true).await?;
+    let blob_client = container_client.blob_client(get_blob_name(recording));
+    let block_blob_client = blob_client.block_blob_client();
+
+    let data: [u8; 1024] = recording.random();
+
+    for (parallel, partition_size) in [(1usize, 2048usize), (2, 1024), (1, 256), (8, 31)] {
+        block_blob_client
+            .managed_upload(Body::from(data.to_vec()), parallel, partition_size)
+            .await?;
+        assert_eq!(
+            blob_client
+                .download(None)
+                .await?
+                .into_raw_body()
+                .collect()
+                .await?[..],
+            data,
+            "Failed parallel={},partition_size={}",
+            parallel,
+            partition_size
+        )
+    }
+
     Ok(())
 }
 

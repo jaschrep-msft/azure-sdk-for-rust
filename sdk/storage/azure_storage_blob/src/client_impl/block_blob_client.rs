@@ -9,10 +9,34 @@ use crate::{
     partitioned_transfer::{self, PartitionedUploadBehavior},
 };
 
+// implement this on handwritten client for now
+impl crate::BlockBlobClient {
+    pub async fn managed_upload(
+        &self,
+        body: Body,
+        parallel: usize,
+        partition_size: usize,
+    ) -> azure_core::Result<()> {
+        self.client
+            .managed_upload(body, parallel, partition_size)
+            .await
+    }
+}
+
 impl BlockBlobClient {
-    async fn managed_upload(&self, body: Body) -> azure_core::Result<()> {
-        partitioned_transfer::upload(body, 1, 1024, &BlockBlobClientUploadBehavior::new(self))
-            .await?;
+    pub async fn managed_upload(
+        &self,
+        body: Body,
+        parallel: usize,
+        partition_size: usize,
+    ) -> azure_core::Result<()> {
+        partitioned_transfer::upload(
+            body,
+            parallel,
+            partition_size,
+            &BlockBlobClientUploadBehavior::new(self),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -66,10 +90,11 @@ impl PartitionedUploadBehavior for BlockBlobClientUploadBehavior<'_> {
     }
 
     async fn finalize(&self) -> azure_core::Result<()> {
+        self.blocks_sender.close();
         let mut blocks: Vec<_> = self.blocks_receiver.clone().collect().await; // TODO is this really the right way to do this?
         blocks.sort_by(|left, right| left.offset.cmp(&right.offset));
         let blocklist = BlockLookupList {
-            committed: Some(
+            latest: Some(
                 blocks
                     .iter()
                     .map(|bi| bi.block_id.as_bytes().to_vec())
