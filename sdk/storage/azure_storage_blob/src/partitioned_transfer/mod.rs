@@ -1,5 +1,7 @@
+mod copy;
 mod download;
 mod upload;
+pub use copy::*;
 pub use download::*;
 pub use upload::*;
 
