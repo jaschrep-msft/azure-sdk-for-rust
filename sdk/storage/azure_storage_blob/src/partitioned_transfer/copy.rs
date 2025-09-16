@@ -32,7 +32,9 @@ pub(crate) async fn copy(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, cmp};
+    use std::{cell::RefCell, cmp, time::Duration};
+
+    use tokio::time::sleep;
 
     use super::*;
 
@@ -47,13 +49,15 @@ mod tests {
     struct MockPartitionedCopyBehavior {
         pub invocations: RefCell<Vec<MockPartitionedCopyBehaviorInvocation>>,
         pub data_len: u64,
+        pub delay_millis: Option<Range<u64>>,
     }
 
     impl MockPartitionedCopyBehavior {
-        pub fn new(data_len: u64) -> Self {
+        pub fn new(data_len: u64, delay_millis: Option<Range<u64>>) -> Self {
             Self {
                 invocations: RefCell::new(vec![]),
                 data_len,
+                delay_millis,
             }
         }
     }
@@ -78,6 +82,12 @@ mod tests {
             self.invocations.borrow_mut().push(
                 MockPartitionedCopyBehaviorInvocation::TransferPartition(range),
             );
+
+            if let Some(delay_millis_range) = self.delay_millis.clone() {
+                let millis = rand::random_range(delay_millis_range);
+                sleep(Duration::from_millis(millis)).await
+            }
+
             Ok(())
         }
 
@@ -103,7 +113,7 @@ mod tests {
         let partition_size = data_len;
         let parallel: usize = 2;
         let expected_ranges = vec![0..data_len];
-        let mock = MockPartitionedCopyBehavior::new(data_len);
+        let mock = MockPartitionedCopyBehavior::new(data_len, None);
 
         copy(parallel, partition_size, &mock).await?;
         assert_partitioned_copy_invocations(&mock, expected_ranges, partition_size);
@@ -117,7 +127,7 @@ mod tests {
         let partition_size = 2048u64;
         let parallel: usize = 2;
         let expected_ranges = vec![0..data_len];
-        let mock = MockPartitionedCopyBehavior::new(data_len);
+        let mock = MockPartitionedCopyBehavior::new(data_len, None);
 
         copy(parallel, partition_size, &mock).await?;
         assert_partitioned_copy_invocations(&mock, expected_ranges, partition_size);
@@ -130,7 +140,7 @@ mod tests {
         let partition_size = 512u64;
         let parallel: usize = 2;
         let expected_ranges = vec![0..partition_size, partition_size..data_len];
-        let mock = MockPartitionedCopyBehavior::new(data_len);
+        let mock = MockPartitionedCopyBehavior::new(data_len, None);
 
         copy(parallel, partition_size, &mock).await?;
         assert_partitioned_copy_invocations(&mock, expected_ranges, partition_size);
@@ -143,7 +153,37 @@ mod tests {
         let partition_size = 1000u64;
         let parallel: usize = 2;
         let expected_ranges = vec![0..partition_size, partition_size..data_len];
-        let mock = MockPartitionedCopyBehavior::new(data_len);
+        let mock = MockPartitionedCopyBehavior::new(data_len, None);
+
+        copy(parallel, partition_size, &mock).await?;
+        assert_partitioned_copy_invocations(&mock, expected_ranges, partition_size);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn many_partitions_sequential() -> AzureResult<()> {
+        let data_len = 1024u64;
+        let partition_size = 32;
+        let parallel: usize = 1;
+        let expected_ranges: Vec<_> = (0..32u64)
+            .map(|i| i * partition_size..i * partition_size + partition_size)
+            .collect();
+        let mock = MockPartitionedCopyBehavior::new(data_len, None);
+
+        copy(parallel, partition_size, &mock).await?;
+        assert_partitioned_copy_invocations(&mock, expected_ranges, partition_size);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn many_partitions_parallel() -> AzureResult<()> {
+        let data_len = 1024u64;
+        let partition_size = 32;
+        let parallel: usize = 10;
+        let expected_ranges: Vec<_> = (0..32u64)
+            .map(|i| i * partition_size..i * partition_size + partition_size)
+            .collect();
+        let mock = MockPartitionedCopyBehavior::new(data_len, Some(1..5));
 
         copy(parallel, partition_size, &mock).await?;
         assert_partitioned_copy_invocations(&mock, expected_ranges, partition_size);
