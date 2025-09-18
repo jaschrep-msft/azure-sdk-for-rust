@@ -297,7 +297,7 @@ impl AccessConditionOptionsExt
 }
 
 impl AccessConditionOptionsExt
-    for crate::generated::models::BlockBlobClientPutBlobFromUrlOptions<'_>
+    for crate::generated::models::BlockBlobClientUploadBlobFromUrlOptions<'_>
 {
     fn with_access_conditions(
         mut self,
@@ -449,7 +449,7 @@ impl AccessConditionOptionsExt for crate::generated::models::PageBlobClientResiz
 }
 
 impl AccessConditionOptionsExt
-    for crate::generated::models::PageBlobClientUpdateSequenceNumberOptions<'_>
+    for crate::generated::models::PageBlobClientSetSequenceNumberOptions<'_>
 {
     fn with_access_conditions(
         mut self,
@@ -623,7 +623,7 @@ impl CustomerProvidedKeyOptionsExt
 }
 
 impl CustomerProvidedKeyOptionsExt
-    for crate::generated::models::BlockBlobClientPutBlobFromUrlOptions<'_>
+    for crate::generated::models::BlockBlobClientUploadBlobFromUrlOptions<'_>
 {
     fn with_customer_provided_key_base64(
         mut self,
