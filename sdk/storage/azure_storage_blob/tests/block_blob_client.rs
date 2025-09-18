@@ -125,7 +125,42 @@ async fn managed_upload(ctx: TestContext) -> Result<(), Box<dyn Error>> {
 
     for (parallel, partition_size) in [(1usize, 2048usize), (2, 1024), (1, 256), (8, 31)] {
         block_blob_client
-            .managed_upload(Body::from(data.to_vec()), parallel, partition_size)
+            .managed_upload(data.to_vec().into(), parallel, partition_size)
+            .await?;
+        assert_eq!(
+            blob_client
+                .download(None)
+                .await?
+                .into_raw_body()
+                .collect()
+                .await?[..],
+            data,
+            "Failed parallel={},partition_size={}",
+            parallel,
+            partition_size
+        )
+    }
+
+    Ok(())
+}
+
+#[recorded::test]
+async fn managed_copy(ctx: TestContext) -> Result<(), Box<dyn Error>> {
+    let recording = ctx.recording();
+    let container_client = get_container_client(recording, true).await?;
+    let blob_client = container_client.blob_client(get_blob_name(recording));
+    let block_blob_client = blob_client.block_blob_client();
+    let src_blob_client = container_client.blob_client(get_blob_name(recording));
+    let src_block_blob_client = src_blob_client.block_blob_client();
+
+    let data: [u8; 1024] = recording.random();
+    src_block_blob_client
+        .managed_upload(data.to_vec().into(), 1, data.len())
+        .await?;
+
+    for (parallel, partition_size) in [(1usize, 2048u64), (2, 1024), (1, 256), (8, 31)] {
+        block_blob_client
+            .managed_copy_from_url(&src_blob_client, parallel, partition_size)
             .await?;
         assert_eq!(
             blob_client

@@ -38,7 +38,3 @@ where
     }
     Ok(())
 }
-
-fn div_round_up(left: usize, right: usize) -> usize {
-    ((left as f64) / (right as f64)).ceil() as usize
-}

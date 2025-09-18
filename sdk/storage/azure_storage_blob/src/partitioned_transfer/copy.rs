@@ -69,7 +69,7 @@ mod tests {
                 .push(MockPartitionedCopyBehaviorInvocation::GetRanges(
                     partition_size,
                 ));
-            let partitions = div_round_up(self.data_len as usize, partition_size as usize) as u64;
+            let partitions = self.data_len.div_ceil(partition_size);
             (0..partitions)
                 .map(|part| {
                     part * partition_size

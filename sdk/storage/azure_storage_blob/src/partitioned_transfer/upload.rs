@@ -51,7 +51,7 @@ async fn upload_bytes_partitions(
     partition_size: usize,
     client: &impl PartitionedUploadBehavior,
 ) -> AzureResult<()> {
-    let num_partitions = div_round_up(content.len(), partition_size);
+    let num_partitions = content.len().div_ceil(partition_size);
     let partitions = (0..num_partitions)
         .map(|i| i * partition_size)
         .map(|offset| offset..std::cmp::min(offset + partition_size, content.len()))
@@ -327,7 +327,7 @@ mod tests {
         partition_size: usize,
         expected_body_type: BodyType,
     ) {
-        let expected_partitions = div_round_up(original_data.len(), partition_size);
+        let expected_partitions = original_data.len().div_ceil(partition_size);
         let invocations = mock.invocations.borrow();
 
         assert_eq!(invocations.len(), expected_partitions + 2);
