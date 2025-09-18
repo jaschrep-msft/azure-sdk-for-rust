@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 use azure_core::{
-    http::{Body, RequestContent, StatusCode},
+    http::{RequestContent, StatusCode},
     Bytes,
 };
 use azure_core_test::{recorded, TestContext};
