@@ -1,4 +1,4 @@
-use std::{cmp, future::Future};
+use std::{any::Any, cmp, future::Future};
 
 use async_channel::{self, Receiver, Sender};
 use azure_core::{
@@ -248,22 +248,7 @@ impl ManagedCopySource for BlobClient {
 }
 
 impl ManagedCopySource for crate::BlobClient {
-    async fn copy_source_info(&self) -> AzureResult<ManagedCopySourceInfo> {
-        let len = self
-            .get_properties(None)
-            .await?
-            .content_length()?
-            .ok_or_else(|| {
-                Error::new(
-                    azure_core::error::ErrorKind::DataConversion,
-                    "No content-length found",
-                )
-            })?;
-
-        Ok(ManagedCopySourceInfo {
-            auth: None,
-            len,
-            url: self.endpoint().to_string(),
-        })
+    fn copy_source_info(&self) -> impl Future<Output = AzureResult<ManagedCopySourceInfo>> {
+        self.client.copy_source_info()
     }
 }
