@@ -31,7 +31,7 @@ impl crate::BlockBlobClient {
 
     pub async fn managed_copy_from_url(
         &self,
-        source: &impl ManagedCopySource,
+        source: ManagedCopySource,
         parallel: usize,
         partition_size: u64,
     ) -> AzureResult<()> {
@@ -59,28 +59,23 @@ impl BlockBlobClient {
 
     pub async fn managed_copy_from_url(
         &self,
-        source: &impl ManagedCopySource,
+        source: ManagedCopySource,
         parallel: usize,
         partition_size: u64,
     ) -> AzureResult<()> {
-        let info = source.copy_source_info().await?;
         partitioned_transfer::copy(
             parallel,
             partition_size,
-            &BlockBlobClientCopyBehavior::new(self, info),
+            &BlockBlobClientCopyBehavior::new(self, source),
         )
         .await
     }
 }
 
-pub struct ManagedCopySourceInfo {
+pub struct ManagedCopySource {
     pub auth: Option<String>,
     pub len: u64,
     pub url: String,
-}
-
-pub trait ManagedCopySource {
-    fn copy_source_info(&self) -> impl Future<Output = AzureResult<ManagedCopySourceInfo>>;
 }
 
 struct BlockInfo {
@@ -98,7 +93,7 @@ struct BlockBlobClientCopyBehavior<'a> {
     client: &'a BlockBlobClient,
     blocks_sender: Sender<BlockInfo>,
     blocks_receiver: Receiver<BlockInfo>,
-    source_info: ManagedCopySourceInfo,
+    source_info: ManagedCopySource,
 }
 
 impl<'a> BlockBlobClientUploadBehavior<'a> {
@@ -113,7 +108,7 @@ impl<'a> BlockBlobClientUploadBehavior<'a> {
 }
 
 impl<'a> BlockBlobClientCopyBehavior<'a> {
-    fn new(client: &'a BlockBlobClient, source_info: ManagedCopySourceInfo) -> Self {
+    fn new(client: &'a BlockBlobClient, source_info: ManagedCopySource) -> Self {
         let (blocks_sender, blocks_receiver) = async_channel::unbounded();
         Self {
             client,
@@ -224,31 +219,4 @@ async fn commit_block_list(
         .await?;
 
     Ok(())
-}
-
-impl ManagedCopySource for BlobClient {
-    async fn copy_source_info(&self) -> AzureResult<ManagedCopySourceInfo> {
-        let len = self
-            .get_properties(None)
-            .await?
-            .content_length()?
-            .ok_or_else(|| {
-                Error::new(
-                    azure_core::error::ErrorKind::DataConversion,
-                    "No content-length found",
-                )
-            })?;
-
-        Ok(ManagedCopySourceInfo {
-            auth: None,
-            len,
-            url: self.endpoint().to_string(),
-        })
-    }
-}
-
-impl ManagedCopySource for crate::BlobClient {
-    fn copy_source_info(&self) -> impl Future<Output = AzureResult<ManagedCopySourceInfo>> {
-        self.client.copy_source_info()
-    }
 }

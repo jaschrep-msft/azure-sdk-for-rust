@@ -6,9 +6,12 @@ use azure_core::{
     Bytes,
 };
 use azure_core_test::{recorded, TestContext};
-use azure_storage_blob::models::{
-    BlobClientDownloadResultHeaders, BlockBlobClientUploadBlobFromUrlOptions, BlockListType,
-    BlockLookupList,
+use azure_storage_blob::{
+    models::{
+        BlobClientDownloadResultHeaders, BlockBlobClientUploadBlobFromUrlOptions, BlockListType,
+        BlockLookupList,
+    },
+    ManagedCopySource,
 };
 use azure_storage_blob_test::{create_test_blob, get_blob_name, get_container_client};
 use std::error::Error;
@@ -146,6 +149,7 @@ async fn managed_upload(ctx: TestContext) -> Result<(), Box<dyn Error>> {
 
 #[recorded::test]
 async fn managed_copy(ctx: TestContext) -> Result<(), Box<dyn Error>> {
+    const len: usize = 1024;
     let recording = ctx.recording();
     let container_client = get_container_client(recording, true).await?;
     let blob_client = container_client.blob_client(get_blob_name(recording));
@@ -153,14 +157,22 @@ async fn managed_copy(ctx: TestContext) -> Result<(), Box<dyn Error>> {
     let src_blob_client = container_client.blob_client(get_blob_name(recording));
     let src_block_blob_client = src_blob_client.block_blob_client();
 
-    let data: [u8; 1024] = recording.random();
+    let data: [u8; len] = recording.random();
     src_block_blob_client
         .managed_upload(data.to_vec().into(), 1, data.len())
         .await?;
 
     for (parallel, partition_size) in [(1usize, 2048u64), (2, 1024), (1, 256), (8, 31)] {
         block_blob_client
-            .managed_copy_from_url(&src_blob_client, parallel, partition_size)
+            .managed_copy_from_url(
+                ManagedCopySource {
+                    url: src_blob_client.endpoint().to_string(),
+                    len: len as u64,
+                    auth: None,
+                },
+                parallel,
+                partition_size,
+            )
             .await?;
         assert_eq!(
             blob_client
