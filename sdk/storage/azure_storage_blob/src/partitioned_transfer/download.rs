@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use std::{cmp::min, ops::Range, sync::Arc};
+use std::{cmp::min, io::Write, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use azure_core::http::{response::PinnedStream, AsyncRawResponse};
@@ -77,8 +77,13 @@ async fn download_range_to_bytes(
     client: Arc<impl PartitionedDownloadBehavior>,
     range: Range<u64>,
 ) -> AzureResult<Bytes> {
-    let response = client.transfer_range(range).await?;
-    response.into_body().collect().await
+    let (_, headers, mut body) = client.transfer_range(range).await?.deconstruct();
+    let content_len = headers.get_as::<usize, _>(&"Content-Length".into())?;
+    let mut buf = Vec::with_capacity(content_len);
+    while let Some(bytes) = body.try_next().await? {
+        buf.write_all(&bytes)?;
+    }
+    Ok(buf.into())
 }
 
 trait DownloadRangeFuture: Future + ConditionalSend {}
