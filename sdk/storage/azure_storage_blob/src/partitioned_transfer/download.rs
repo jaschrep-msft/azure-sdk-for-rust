@@ -78,7 +78,7 @@ async fn download_range_to_bytes(
     range: Range<u64>,
 ) -> AzureResult<Bytes> {
     let (_, headers, mut body) = client.transfer_range(range).await?.deconstruct();
-    let content_len = headers.get_as::<usize, _>(&"Content-Length".into())?;
+    let content_len = headers.get_as::<usize, _>(&"content-length".into())?;
     let mut buf = Vec::with_capacity(content_len);
     while let Some(bytes) = body.try_next().await? {
         buf.write_all(&bytes)?;
