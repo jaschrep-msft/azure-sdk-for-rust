@@ -1,15 +1,17 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use std::{cmp::min, collections::VecDeque, io::Read, ops::Range, sync::Arc};
+use std::{cmp::min, collections::VecDeque, io::Write, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use azure_core::{
-    error::ErrorKind,
-    http::{response::PinnedStream, AsyncRawResponse, StatusCode},
+    http::{
+        response::{AsyncResponseBody, PinnedStream},
+        AsyncRawResponse, StatusCode,
+    },
     stream::BytesStream,
 };
-use bytes::{Buf, Bytes};
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::{stream::FuturesOrdered, StreamExt};
 
 use crate::models::http_ranges::ContentRange;
@@ -69,13 +71,13 @@ where
         (range_slice, remaining_slice) = remaining_slice.split_at_mut(download_range.len());
         let client = client.clone();
         ops.push_back(Ok(move || {
-            download_range_to_span(client, download_range, range_slice)
+            download_range_to_slice(client, download_range, range_slice)
         }));
     }
 
     // TODO Get the first download range into the queue with everything else instead of running separately
     let (left, right) = futures::future::join(
-        response_to_span(initial_response, initial_range_slice),
+        body_to_slice(&mut initial_response.into_body(), initial_range_slice),
         run_all_with_concurrency_limit(futures::stream::iter(ops), parallel),
     )
     .await;
@@ -147,7 +149,7 @@ where
         while ops.len() < parallel {
             match ranges.pop_front() {
                 Some(range) => {
-                    ops.push_back(Box::pin(download_range_to_bytes(client.clone(), range)))
+                    ops.push_back(Box::pin(download_range_buffered(client.clone(), range)))
                 }
                 None => break,
             }
@@ -159,37 +161,40 @@ where
     Ok(Box::pin(stream))
 }
 
-async fn download_range_to_bytes(
+async fn download_range_buffered(
     client: Arc<impl PartitionedDownloadBehavior>,
     range: Range<usize>,
 ) -> AzureResult<Bytes> {
     let response = client.transfer_range(Some(range)).await?;
-    response.into_body().collect().await
+    let mut dst = match get_body_len(&response)? {
+        Some(content_length) => BytesMut::with_capacity(content_length),
+        None => BytesMut::new(),
+    };
+    let mut response_body = response.into_body();
+    while let Some(bytes) = response_body.try_next().await? {
+        dst.put_slice(&bytes);
+    }
+    Ok(dst.freeze())
 }
 
-async fn download_range_to_span(
+async fn download_range_to_slice(
     client: Arc<impl PartitionedDownloadBehavior>,
     range: Range<usize>,
-    span: &mut [u8],
+    dst: &mut [u8],
 ) -> AzureResult<()> {
-    let response = client.transfer_range(Some(range)).await?;
-    let content_length = get_body_len(&response)?;
-    if let Some(len) = content_length {
-        if span.len() < len {
-            todo!("error");
-        }
-    }
-    response_to_span(response, span).await
+    body_to_slice(
+        &mut client.transfer_range(Some(range)).await?.into_body(),
+        dst,
+    )
+    .await
 }
-async fn response_to_span(response: AsyncRawResponse, span: &mut [u8]) -> AzureResult<()> {
-    let mut response_body = response.into_body();
-    let mut total = 0;
+
+async fn body_to_slice(
+    response_body: &mut AsyncResponseBody,
+    mut dst: &mut [u8],
+) -> AzureResult<()> {
     while let Some(bytes) = response_body.try_next().await? {
-        let read = bytes
-            .reader()
-            .read(&mut span[total..])
-            .map_err(|_e| ErrorKind::Other)?;
-        total += read;
+        dst.write_all(&bytes)?;
     }
     Ok(())
 }
