@@ -980,41 +980,54 @@ async fn test_managed_download(ctx: TestContext) -> Result<(), Box<dyn Error>> {
         )
         .await?;
 
-    for (parallel, partition_len, download_range, expected_gets) in [
-        (2, DATA_LEN, None, 1),
-        (2, DATA_LEN * 2, None, 1),
-        (2, 512, None, 2),
-        (1, 256, None, 4),
-        (8, 31, None, 34),
-        (1, 16, Some((0, 16)), 1),
-        (4, 16, Some((16, 20)), 1),
-        (4, 256, Some((0, 12345)), 4),
-        (4, 100, Some((123, 223)), 1),
-    ] {
-        request_count.store(0, Ordering::Relaxed);
-        let _scope = count_policy.check_request_scope();
-        let mut download_stream = blob_client
-            .managed_download(Some(BlobClientManagedDownloadOptions {
-                partition_size: Some(NonZero::new(partition_len).unwrap()),
-                parallel: Some(NonZero::new(parallel).unwrap()),
-                range: download_range.map(|r| r.0..r.1),
-                ..Default::default()
-            }))
-            .await?;
+    for use_streaming in [true, false] {
+        for (parallel, partition_len, download_range, expected_gets) in [
+            (2, DATA_LEN, None, 1),
+            (2, DATA_LEN * 2, None, 1),
+            (2, 512, None, 2),
+            (1, 256, None, 4),
+            (8, 31, None, 34),
+            (1, 16, Some((0, 16)), 1),
+            (4, 16, Some((16, 20)), 1),
+            (4, 256, Some((0, 12345)), 4),
+            (4, 100, Some((123, 223)), 1),
+        ] {
+            request_count.store(0, Ordering::Relaxed);
+            let _scope = count_policy.check_request_scope();
+            let downloaded_data = if use_streaming {
+                let mut download_stream = blob_client
+                    .managed_download_streaming(Some(BlobClientManagedDownloadOptions {
+                        partition_size: Some(NonZero::new(partition_len).unwrap()),
+                        parallel: Some(NonZero::new(parallel).unwrap()),
+                        range: download_range.map(|r| r.0..r.1),
+                        ..Default::default()
+                    }))
+                    .await?;
 
-        let mut downloaded_data = BytesMut::new();
-        while let Some(bytes) = download_stream.try_next().await? {
-            downloaded_data.put(bytes);
+                let mut downloaded_data = BytesMut::new();
+                while let Some(bytes) = download_stream.try_next().await? {
+                    downloaded_data.put(bytes);
+                }
+                downloaded_data.freeze()
+            } else {
+                blob_client
+                    .managed_download_content(Some(BlobClientManagedDownloadOptions {
+                        partition_size: Some(NonZero::new(partition_len).unwrap()),
+                        parallel: Some(NonZero::new(parallel).unwrap()),
+                        range: download_range.map(|r| r.0..r.1),
+                        ..Default::default()
+                    }))
+                    .await?
+            };
+            assert_eq!(
+                &downloaded_data,
+                match download_range {
+                    Some(r) => &data[r.0..min(r.1, DATA_LEN)],
+                    None => &data,
+                }
+            );
+            assert_eq!(request_count.load(Ordering::Relaxed), expected_gets);
         }
-        let downloaded_data = downloaded_data.freeze();
-        assert_eq!(
-            &downloaded_data,
-            match download_range {
-                Some(r) => &data[r.0..min(r.1, DATA_LEN)],
-                None => &data,
-            }
-        );
-        assert_eq!(request_count.load(Ordering::Relaxed), expected_gets);
     }
 
     Ok(())
@@ -1040,19 +1053,26 @@ async fn test_managed_download_empty(ctx: TestContext) -> Result<(), Box<dyn Err
         .upload(RequestContent::from(vec![]), false, 0, None)
         .await?;
 
-    request_count.store(0, Ordering::Relaxed);
-    let _scope = count_policy.check_request_scope();
-    let mut download_stream = blob_client.managed_download(None).await?;
+    for use_streaming in [true, false] {
+        request_count.store(0, Ordering::Relaxed);
+        let _scope = count_policy.check_request_scope();
 
-    let mut downloaded_data = BytesMut::new();
-    while let Some(bytes) = download_stream.try_next().await? {
-        downloaded_data.put(bytes);
+        let downloaded_data = if use_streaming {
+            let mut download_stream = blob_client.managed_download_streaming(None).await?;
+
+            let mut downloaded_data = BytesMut::new();
+            while let Some(bytes) = download_stream.try_next().await? {
+                downloaded_data.put(bytes);
+            }
+            downloaded_data.freeze()
+        } else {
+            blob_client.managed_download_content(None).await?
+        };
+
+        assert_eq!(downloaded_data.len(), 0);
+        // 1 op with a range, 1 op without after the first one fails
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
     }
-    let downloaded_data = downloaded_data.freeze();
-
-    assert_eq!(downloaded_data.len(), 0);
-    // 1 op with a range, 1 op without after the first one fails
-    assert_eq!(request_count.load(Ordering::Relaxed), 2);
 
     Ok(())
 }
