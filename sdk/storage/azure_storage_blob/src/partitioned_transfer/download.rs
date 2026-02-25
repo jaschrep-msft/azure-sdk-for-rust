@@ -194,7 +194,7 @@ async fn body_to_slice(
     mut dst: &mut [u8],
 ) -> AzureResult<()> {
     while let Some(bytes) = response_body.try_next().await? {
-        dst.write_all(&bytes)?;
+        dst.put_slice(&bytes);
     }
     Ok(())
 }
