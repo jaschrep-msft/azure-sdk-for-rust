@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use std::{cmp::min, collections::VecDeque, io::Write, ops::Range, sync::Arc};
+use std::{cmp::min, collections::VecDeque, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use azure_core::{
@@ -11,10 +11,13 @@ use azure_core::{
     },
     stream::BytesStream,
 };
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::{stream::FuturesOrdered, StreamExt};
+use bytes::{BufMut, Bytes};
 
-use crate::models::http_ranges::ContentRange;
+use crate::{
+    conditional_send::ConditionalSend,
+    models::http_ranges::ContentRange,
+    streams::{parallel_ordered_stream::ParallelOrderedStream, SelfFetchingStream},
+};
 
 use super::*;
 
@@ -106,7 +109,6 @@ pub(crate) async fn download_streaming<Behavior>(
 where
     Behavior: PartitionedDownloadBehavior + Send + Sync + 'static,
 {
-    let parallel = parallel.get();
     let partition_size = partition_size.get();
 
     // Outer bound estimate of the resource range that will be downloaded. The actual download
@@ -128,7 +130,7 @@ where
     )
     .await?;
 
-    let mut ranges = match analyze_initial_response(
+    let remaining_ranges = match analyze_initial_response(
         &initial_response,
         partition_size,
         max_download_range.end,
@@ -137,44 +139,32 @@ where
         None => Default::default(),
     };
 
-    // the first operation has a different type from the others.
-    // fully type this variable out to specify dyn.
-    let fut: Pin<Box<dyn DownloadRangeFuture<Output = AzureResult<Bytes>>>> =
-        Box::pin(initial_response.into_body().collect());
-    let mut ops = FuturesOrdered::new();
-    ops.push_back(fut);
+    let mut streams: Vec<Pin<Box<dyn Stream<Item = AzureResult<Bytes>> + Send + Unpin>>> =
+        Vec::with_capacity(remaining_ranges.len() + 1);
 
-    let stream = futures::stream::poll_fn(move |cx| {
-        // fill to max parallel ops
-        while ops.len() < parallel {
-            match ranges.pop_front() {
-                Some(range) => {
-                    ops.push_back(Box::pin(download_range_buffered(client.clone(), range)))
-                }
-                None => break,
-            }
-        }
+    streams.push(Box::pin(initial_response.into_body()));
+    for sub_stream in remaining_ranges.into_iter().map(|range| {
+        let fut = request_stream(client.clone(), range);
+        let wrapper = SelfFetchingStream::new(Box::pin(fut));
+        let stream: Pin<Box<dyn Stream<Item = AzureResult<Bytes>> + Send + Unpin>> =
+            Box::pin(wrapper);
+        stream
+    }) {
+        streams.push(sub_stream);
+    }
 
-        ops.poll_next_unpin(cx)
-    });
+    let stream = ParallelOrderedStream::new(streams, parallel);
 
     Ok(Box::pin(stream))
 }
 
-async fn download_range_buffered(
+async fn request_stream(
     client: Arc<impl PartitionedDownloadBehavior>,
     range: Range<usize>,
-) -> AzureResult<Bytes> {
+) -> AzureResult<PinnedStream> {
     let response = client.transfer_range(Some(range)).await?;
-    let mut dst = match get_body_len(&response)? {
-        Some(content_length) => BytesMut::with_capacity(content_length),
-        None => BytesMut::new(),
-    };
-    let mut response_body = response.into_body();
-    while let Some(bytes) = response_body.try_next().await? {
-        dst.put_slice(&bytes);
-    }
-    Ok(dst.freeze())
+    let response_body = response.into_body();
+    Ok(Box::pin(response_body))
 }
 
 async fn download_range_to_slice(
