@@ -14,7 +14,6 @@ use azure_core::{
 use bytes::{BufMut, Bytes};
 
 use crate::{
-    conditional_send::ConditionalSend,
     models::http_ranges::ContentRange,
     streams::{parallel_ordered_stream::ParallelOrderedStream, SelfFetchingStream},
 };
@@ -277,8 +276,8 @@ fn analyze_initial_response(
     }
 }
 
-trait DownloadRangeFuture: Future + ConditionalSend {}
-impl<T: Future + ConditionalSend> DownloadRangeFuture for T {}
+trait DownloadRangeFuture: Future + Send {}
+impl<T: Future + Send> DownloadRangeFuture for T {}
 
 #[cfg(test)]
 mod tests {
