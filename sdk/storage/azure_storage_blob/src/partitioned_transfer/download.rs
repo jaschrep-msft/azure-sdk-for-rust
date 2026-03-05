@@ -1,14 +1,22 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use std::{cmp::min, collections::VecDeque, ops::Range, sync::Arc};
+use std::{
+    cmp::min,
+    collections::VecDeque,
+    ops::Range,
+    sync::{
+        mpsc::{self, Receiver, Sender, TryRecvError},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use azure_core::{
     http::{response::PinnedStream, AsyncRawResponse, StatusCode},
     stream::BytesStream,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{stream::FuturesOrdered, StreamExt};
 
 use crate::models::http_ranges::ContentRange;
@@ -111,12 +119,83 @@ where
     Ok(Box::pin(stream))
 }
 
+/// Makes a download range call on the given client using the given range and collects the
+/// resulting bytes into a contiguous buffer.
+///
+/// This function spawns an additional task in the async runtime to handle copying bytes.
+/// This allows the download stream to be read continuously without the interruption of
+/// copying buffers in memory.
 async fn download_range_to_bytes(
     client: Arc<impl PartitionedDownloadBehavior>,
     range: Range<usize>,
 ) -> AzureResult<Bytes> {
     let response = client.transfer_range(Some(range)).await?;
-    response.into_body().collect().await
+    let destination = match get_body_len(&response)? {
+        Some(len) => BytesMut::with_capacity(len),
+        None => BytesMut::new(),
+    };
+
+    let (byte_copy_sender, byte_copy_receiver) = mpsc::channel();
+    let (result_sender, result_receiver) = mpsc::channel();
+
+    let byte_copy_task = azure_core::async_runtime::get_async_runtime().spawn(Box::pin(
+        collect_bytes_from_channel(destination, byte_copy_receiver, result_sender),
+    ));
+
+    let mut response_body = response.into_body();
+    while let Some(bytes) = response_body.try_next().await? {
+        byte_copy_sender.send(bytes).unwrap(); // TODO
+    }
+
+    drop(byte_copy_sender);
+    let _ = byte_copy_task.await;
+
+    let result = result_receiver.recv().unwrap(); // TODO
+
+    Ok(result)
+}
+
+/// Reads bytes from a channel receiver and collects them into a provided buffer.
+/// Sends the completed result into the provided channel sender.
+async fn collect_bytes_from_channel(
+    mut destination: BytesMut,
+    receiver: Receiver<Bytes>,
+    result_sender: Sender<Bytes>,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(bytes) => destination.extend_from_slice(&bytes), // TODO should I also yield here? after n-many loops?
+            Err(TryRecvError::Empty) => {
+                azure_core::async_runtime::get_async_runtime()
+                    .yield_now()
+                    .await
+            }
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    result_sender.send(destination.freeze()).unwrap(); // TODO
+}
+
+/// First attempts to get the length from the Content-Range header. Content range will give the
+/// most accurate reading for the content length, unaffected by an encoding such as structured
+/// message. It is highly unlikely content-range will be absent.
+/// Uses the content-length header if content-range is unavailable.
+fn get_body_len(response: &AsyncRawResponse) -> AzureResult<Option<usize>> {
+    if let Some(content_range) = response
+        .headers()
+        .get_optional_as::<ContentRange, _>(&"content-range".into())?
+    {
+        if let Some(range) = content_range.range {
+            return Ok(Some(range.1 - range.0));
+        }
+    }
+    if let Some(content_length) = response
+        .headers()
+        .get_optional_as::<usize, _>(&"content-length".into())?
+    {
+        return Ok(Some(content_length));
+    }
+    Ok(None)
 }
 
 trait DownloadRangeFuture: Future + Send {}
