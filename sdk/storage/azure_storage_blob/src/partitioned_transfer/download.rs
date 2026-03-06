@@ -98,15 +98,9 @@ async fn download_range_to_bytes(
     range: Range<usize>,
 ) -> AzureResult<Bytes> {
     let response = client.transfer_range(Some(range)).await?;
-    let mut dst = match get_body_len(&response)? {
-        Some(content_length) => BytesMut::with_capacity(content_length),
-        None => BytesMut::new(),
-    };
     let mut response_body = response.into_body();
-    while let Some(bytes) = response_body.try_next().await? {
-        dst.extend_from_slice(&bytes);
-    }
-    Ok(dst.freeze())
+    while let Some(_bytes) = response_body.try_next().await? {}
+    Ok(Bytes::new())
 }
 
 /// Performs a `transfer_range()` call with the given range. If this results in a
