@@ -1,7 +1,15 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use std::{cmp::min, collections::VecDeque, ops::Range, sync::Arc};
+use std::{
+    cmp::min,
+    collections::VecDeque,
+    ops::Range,
+    sync::{
+        mpsc::{self, Receiver, Sender, TryRecvError},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use azure_core::{
@@ -98,15 +106,50 @@ async fn download_range_to_bytes(
     range: Range<usize>,
 ) -> AzureResult<Bytes> {
     let response = client.transfer_range(Some(range)).await?;
-    let mut dst = match get_body_len(&response)? {
+    let dst = match get_body_len(&response)? {
         Some(content_length) => BytesMut::with_capacity(content_length),
         None => BytesMut::new(),
     };
+
+    let (byte_copy_sender, byte_copy_receiver) = mpsc::channel();
+    let (result_sender, result_receiver) = mpsc::channel();
+
+    let byte_copy_task = azure_core::async_runtime::get_async_runtime().spawn(Box::pin(
+        collect_bytes_from_channel(dst, byte_copy_receiver, result_sender),
+    ));
+
     let mut response_body = response.into_body();
     while let Some(bytes) = response_body.try_next().await? {
-        dst.extend_from_slice(&bytes);
+        byte_copy_sender.send(bytes).unwrap(); // TODO
     }
-    Ok(dst.freeze())
+
+    drop(byte_copy_sender);
+    let _ = byte_copy_task.await;
+
+    let result = result_receiver.recv().unwrap(); // TODO
+
+    Ok(result)
+}
+
+/// Reads bytes from a channel receiver and collects them into a provided buffer.
+/// Sends the completed result into the provided channel sender.
+async fn collect_bytes_from_channel(
+    mut destination: BytesMut,
+    receiver: Receiver<Bytes>,
+    result_sender: Sender<Bytes>,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(bytes) => destination.extend_from_slice(&bytes), // TODO should I also yield here? after n-many loops?
+            Err(TryRecvError::Empty) => {
+                azure_core::async_runtime::get_async_runtime()
+                    .yield_now()
+                    .await
+            }
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    result_sender.send(destination.freeze()).unwrap(); // TODO
 }
 
 /// Performs a `transfer_range()` call with the given range. If this results in a
